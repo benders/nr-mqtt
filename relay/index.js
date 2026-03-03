@@ -9,6 +9,7 @@ const config = {
   mqttBrokerUrl: process.env.MQTT_BROKER_URL || 'mqtt://mosquitto:1883',
   mqttUsername: process.env.MQTT_USERNAME || 'nr-relay',
   mqttPassword: process.env.MQTT_PASSWORD || '',
+  mqttTopics: (process.env.MQTT_TOPICS || '#').split(',').map(t => t.trim()).filter(Boolean),
   nrAccountId: process.env.NEW_RELIC_ACCOUNT_ID || '',
   nrInsertKey: process.env.NEW_RELIC_INSERT_KEY || '',
   batchSize: parseInt(process.env.BATCH_SIZE || '500', 10),
@@ -52,6 +53,7 @@ const counters = {
   eventsForwarded: 0,
   nrErrors: 0,
   parseErrors: 0,
+  droppedNoEventType: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,66 +62,26 @@ const counters = {
 let eventBuffer = [];
 
 // ---------------------------------------------------------------------------
-// Map compact accel fields to full New Relic event schema
-// ---------------------------------------------------------------------------
-function mapAccelEvent(raw, deviceIdFromTopic) {
-  // Validate required compact fields
-  if (raw.ts === undefined || raw.x === undefined || raw.y === undefined ||
-      raw.z === undefined || raw.m === undefined) {
-    throw new Error(`missing required accel fields: ${JSON.stringify(raw)}`);
-  }
-
-  return {
-    eventType: 'AccelSample',
-    timestamp: raw.ts,   // NR uses millisecond epoch for eventTimestamp; keep ts too
-    ts: raw.ts,
-    accelX: raw.x,
-    accelY: raw.y,
-    accelZ: raw.z,
-    magnitude: raw.m,
-    deviceId: raw.dev || deviceIdFromTopic,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Map status fields to DeviceStatus event
-// ---------------------------------------------------------------------------
-function mapStatusEvent(raw, deviceIdFromTopic) {
-  return {
-    eventType: 'DeviceStatus',
-    timestamp: raw.ts || Date.now(),
-    deviceId: raw.dev || deviceIdFromTopic,
-    uptime: raw.uptime,
-    rssi: raw.rssi,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Post a batch to New Relic Event API
-// Returns true on success, false on failure.
 // ---------------------------------------------------------------------------
 async function postToNewRelic(events) {
-  const body = JSON.stringify(events);
   const res = await fetch(NR_EVENTS_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'X-Insert-Key': config.nrInsertKey,
     },
-    body,
+    body: JSON.stringify(events),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`NR API responded ${res.status}: ${text}`);
   }
-  return true;
 }
 
 // ---------------------------------------------------------------------------
-// Flush the current buffer to New Relic
-// Takes a snapshot of the buffer, clears it, then attempts to send.
-// On first failure: retries once. On second failure: drops batch and logs.
+// Flush a snapshot of events to New Relic (up to 2 attempts)
 // ---------------------------------------------------------------------------
 async function flushBatch(events) {
   if (events.length === 0) return;
@@ -150,8 +112,7 @@ async function flushBatch(events) {
 }
 
 // ---------------------------------------------------------------------------
-// Drain the buffer: take a snapshot, clear the live buffer, then flush.
-// This ensures new events arriving during an in-flight HTTP call are not lost.
+// Drain the buffer atomically so in-flight events aren't double-sent
 // ---------------------------------------------------------------------------
 async function drainBuffer() {
   if (eventBuffer.length === 0) return;
@@ -168,7 +129,7 @@ const client = mqtt.connect(config.mqttBrokerUrl, {
   username: config.mqttUsername,
   password: config.mqttPassword,
   clean: true,
-  reconnectPeriod: 5000,       // retry every 5s on disconnect
+  reconnectPeriod: 5000,
   connectTimeout: 15000,
   keepalive: 60,
 });
@@ -176,42 +137,24 @@ const client = mqtt.connect(config.mqttBrokerUrl, {
 client.on('connect', () => {
   log('info', 'connected to MQTT broker', { url: config.mqttBrokerUrl });
 
-  client.subscribe('geeforce/+/accel', { qos: 0 }, (err) => {
-    if (err) {
-      log('error', 'failed to subscribe to accel topic', { error: err.message });
-    } else {
-      log('info', 'subscribed', { topic: 'geeforce/+/accel' });
-    }
-  });
-
-  client.subscribe('geeforce/+/status', { qos: 0 }, (err) => {
-    if (err) {
-      log('error', 'failed to subscribe to status topic', { error: err.message });
-    } else {
-      log('info', 'subscribed', { topic: 'geeforce/+/status' });
-    }
-  });
+  for (const topic of config.mqttTopics) {
+    client.subscribe(topic, { qos: 0 }, (err) => {
+      if (err) {
+        log('error', 'failed to subscribe', { topic, error: err.message });
+      } else {
+        log('info', 'subscribed', { topic });
+      }
+    });
+  }
 });
 
-client.on('reconnect', () => {
-  log('warn', 'reconnecting to MQTT broker');
-});
-
-client.on('offline', () => {
-  log('warn', 'MQTT client offline');
-});
-
-client.on('error', (err) => {
-  log('error', 'MQTT client error', { error: err.message });
-});
+client.on('reconnect', () => log('warn', 'reconnecting to MQTT broker'));
+client.on('offline',   () => log('warn', 'MQTT client offline'));
+client.on('error',     (err) => log('error', 'MQTT client error', { error: err.message }));
 
 client.on('message', (topic, payload) => {
   counters.messagesReceived += 1;
-
-  // Extract device ID from topic: geeforce/<deviceId>/accel|status
-  const topicParts = topic.split('/');
-  const deviceIdFromTopic = topicParts[1] || 'unknown';
-  const messageType = topicParts[2];
+  const receivedAt = Date.now();
 
   let raw;
   try {
@@ -226,21 +169,14 @@ client.on('message', (topic, payload) => {
     return;
   }
 
-  let event;
-  try {
-    if (messageType === 'accel') {
-      event = mapAccelEvent(raw, deviceIdFromTopic);
-    } else if (messageType === 'status') {
-      event = mapStatusEvent(raw, deviceIdFromTopic);
-    } else {
-      log('debug', 'ignoring unknown topic type', { topic });
-      return;
-    }
-  } catch (mapErr) {
-    counters.parseErrors += 1;
-    log('warn', 'failed to map event fields', { topic, error: mapErr.message });
+  if (!raw.eventType) {
+    counters.droppedNoEventType += 1;
+    log('warn', 'message dropped: missing eventType', { topic });
     return;
   }
+
+  // Infer timestamp from receive time if the payload omits it
+  const event = raw.timestamp !== undefined ? raw : { ...raw, timestamp: receivedAt };
 
   eventBuffer.push(event);
   counters.eventsBuffered += 1;
@@ -251,29 +187,22 @@ client.on('message', (topic, payload) => {
     bufferSize: eventBuffer.length,
   });
 
-  // Flush immediately if we hit the batch size limit
   if (eventBuffer.length >= config.batchSize) {
     log('info', 'batch size limit reached, flushing', { batchSize: config.batchSize });
-    drainBuffer().catch((err) => {
-      log('error', 'unexpected drain error', { error: err.message });
-    });
+    drainBuffer().catch((err) => log('error', 'unexpected drain error', { error: err.message }));
   }
 });
 
 // ---------------------------------------------------------------------------
-// Periodic flush by time window
+// Periodic flush
 // ---------------------------------------------------------------------------
 const flushTimer = setInterval(() => {
-  drainBuffer().catch((err) => {
-    log('error', 'unexpected periodic drain error', { error: err.message });
-  });
+  drainBuffer().catch((err) => log('error', 'unexpected periodic drain error', { error: err.message }));
 }, config.batchIntervalMs);
-
-// Keep the timer from preventing process exit during graceful shutdown
 flushTimer.unref();
 
 // ---------------------------------------------------------------------------
-// Periodic stats log (every 60s at info level)
+// Periodic stats log (every 60s)
 // ---------------------------------------------------------------------------
 const statsTimer = setInterval(() => {
   log('info', 'relay stats', { ...counters });
@@ -290,13 +219,10 @@ async function shutdown(signal) {
   shuttingDown = true;
 
   log('info', 'shutting down', { signal });
-
   clearInterval(flushTimer);
   clearInterval(statsTimer);
 
-  // Stop receiving new messages
   client.end(false, {}, async () => {
-    // Flush anything remaining in the buffer
     try {
       await drainBuffer();
     } catch (err) {
@@ -306,7 +232,6 @@ async function shutdown(signal) {
     process.exit(0);
   });
 
-  // Force exit after 10s if graceful shutdown hangs
   setTimeout(() => {
     log('warn', 'forced exit after shutdown timeout');
     process.exit(1);
@@ -314,11 +239,12 @@ async function shutdown(signal) {
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 log('info', 'nr-mqtt-relay starting', {
   mqttBrokerUrl: config.mqttBrokerUrl,
   mqttUsername: config.mqttUsername,
+  mqttTopics: config.mqttTopics,
   nrAccountId: config.nrAccountId,
   batchSize: config.batchSize,
   batchIntervalMs: config.batchIntervalMs,

@@ -1,7 +1,7 @@
 # nr-mqtt Architecture
 
-nr-mqtt is a Docker Compose application that bridges MQTT telemetry from
-Particle Photon devices to the New Relic Event API.
+nr-mqtt is a Docker Compose application that relays MQTT messages to the
+New Relic Event API.
 
 See `README.md` for setup, configuration, and operational runbook.
 
@@ -28,52 +28,43 @@ Two services defined in `docker-compose.yml`:
 startup
   validate required env vars, exit 1 if missing
   connect to Mosquitto (MQTT_BROKER_URL, username, password)
-  subscribe to geeforce/+/accel and geeforce/+/status (QoS 0)
+  subscribe to each topic in MQTT_TOPICS (QoS 0, default: #)
   start flush timer (BATCH_INTERVAL_MS, default 2000ms)
-  start HTTP health server on :3000
 
 on MQTT message (topic, payload)
-  parse JSON payload
-  set eventType = "AccelSample" or "DeviceStatus" based on topic suffix
-  map short fields to NR event fields (see README § New Relic Event Schema)
-  push mapped event to pendingBatch[]
-  if pendingBatch.length >= BATCH_SIZE: flushBatch()
+  record receivedAt = Date.now()
+  parse JSON payload — drop with warning on parse error
+  require eventType field — drop with warning if missing
+  if timestamp absent: set timestamp = receivedAt
+  push event to buffer (payload passed through as-is otherwise)
+  if buffer.length >= BATCH_SIZE: drainBuffer()
 
-flushBatch()
-  if pendingBatch is empty: return
-  snapshot = pendingBatch.splice(0)       // drain atomically
-  POST snapshot to NR Event API (up to 3 retries, 1s delay)
+drainBuffer()
+  snapshot = buffer; buffer = []   // atomic drain
+  POST snapshot to NR Event API (2 attempts, 1s delay on retry)
   log result
 
 NR Event API call
   POST https://insights-collector.newrelic.com/v1/accounts/{accountId}/events
   Headers: Content-Type: application/json, X-Insert-Key: {NEW_RELIC_INSERT_KEY}
   Body: JSON.stringify(snapshotArray)
-
-health server GET /health
-  200 OK  {"status":"ok","pending":N,"mqttConnected":true}
-  503     if MQTT is disconnected
 ```
 
 ### Batching behaviour
 
-| Condition                         | Action                            |
-|-----------------------------------|-----------------------------------|
-| `pendingBatch.length >= BATCH_SIZE` | Flush immediately               |
-| Timer fires (BATCH_INTERVAL_MS)   | Flush if batch non-empty          |
-| POST fails, attempt ≤ 3           | Retry with 1s delay               |
-| POST fails, attempt > 3           | Discard batch, log error          |
-
-At 3 Hz per device the default 2-second window produces ~6 events per flush.
-BATCH_SIZE (default 500) is a safety valve for burst scenarios.
+| Condition                           | Action                          |
+|-------------------------------------|---------------------------------|
+| `buffer.length >= BATCH_SIZE`       | Flush immediately               |
+| Timer fires (BATCH_INTERVAL_MS)     | Flush if buffer non-empty       |
+| POST fails, first attempt           | Retry once after 1s             |
+| POST fails after retry              | Discard batch, log error        |
 
 ---
 
 ## Security
 
-- Port 1883 is plain TCP. The `hirotakaster/MQTT` Particle library does not
-  support TLS, so TLS is intentionally omitted. Restrict port 1883 to the
-  local LAN via firewall; do not expose it to the internet.
+- Port 1883 is plain TCP. Restrict it to the local LAN via firewall; do not
+  expose it to the internet.
 - The relay uses a dedicated MQTT credential (`nr-relay`) separate from device
   credentials, limiting blast radius if one is compromised.
 - The New Relic Insert Key is injected via environment variable and never
@@ -89,6 +80,6 @@ BATCH_SIZE (default 500) is a safety valve for burst scenarios.
 message. Mosquitto publishes `$SYS` every 10 s; a successful receive confirms
 the broker accepts connections.
 
-**relay** — `GET /health` on port 3000 (internal only). Returns 200 when MQTT
-is connected, 503 otherwise. `depends_on: condition: service_healthy` prevents
-the relay from starting before the broker is ready.
+**relay** — `depends_on: condition: service_healthy` prevents the relay from
+starting before the broker is ready. The relay logs connection and subscription
+state at startup.
