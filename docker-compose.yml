@@ -1,0 +1,36 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    networks:
+      - mqtt-net
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -p 1883 -u nr-relay -P \"${MQTT_PASSWORD}\" -t '$$SYS/#' -C 1 -W 3 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  relay:
+    build: ./relay
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      mosquitto:
+        condition: service_started
+    networks:
+      - mqtt-net
+
+networks:
+  mqtt-net:
+    driver: bridge
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:

@@ -1,0 +1,16 @@
+{
+  "name": "nr-mqtt-relay",
+  "version": "1.0.0",
+  "description": "MQTT to New Relic Event API relay for gee-force telemetry",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.1"
+  },
+  "license": "MIT"
+}
